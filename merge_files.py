@@ -4,7 +4,7 @@
 Без внешних зависимостей — только стандартная библиотека Python 3.
 """
 
-__version__ = "1.3.0"
+__version__ = "1.5.0"
 
 import argparse
 import os
@@ -319,12 +319,197 @@ def write_file_content(out, file_path: Path, root: Path) -> int:
     return len(header.encode("utf-8")) + len(content.encode("utf-8")) + len(footer.encode("utf-8"))
 
 
+# ---------------------------------------------------------------------------
+# Статистика — дерево каталогов
+# ---------------------------------------------------------------------------
+
+def _human_size(n: int) -> str:
+    """Человекочитаемый размер: Б, КБ, МБ, ГБ, ТБ."""
+    if n < 1024:
+        return f"{n} Б"
+    units = ["КБ", "МБ", "ГБ", "ТБ"]
+    v = float(n)
+    for unit in units:
+        v /= 1024.0
+        if v < 1024.0 or unit == units[-1]:
+            return f"{v:.2f} {unit}"
+    return f"{v:.2f} ТБ"
+
+
+class _DirNode:
+    """Узел дерева каталогов: агрегирует файлы во всём поддереве."""
+
+    __slots__ = ("name", "children", "files", "bytes")
+
+    def __init__(self, name: str):
+        self.name = name
+        self.children: dict[str, "_DirNode"] = {}
+        self.files = 0
+        self.bytes = 0
+
+    def get_or_create(self, name: str) -> "_DirNode":
+        node = self.children.get(name)
+        if node is None:
+            node = _DirNode(name)
+            self.children[name] = node
+        return node
+
+    def add_file(self, size_bytes: int):
+        """Кумулятивный учёт: увеличивает счётчики у текущего узла."""
+        self.files += 1
+        self.bytes += size_bytes
+
+
+class StatsTree:
+    """
+    Строит дерево каталогов от ``root`` и печатает его с размерами.
+
+    Каждый узел аккумулирует данные **всех** файлов во всём поддереве
+    (кумулятивно), поэтому сумма по верхнеуровневым ветвям равна итогу.
+    """
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.tree = _DirNode(".")
+
+    def add(self, fp: Path, size_bytes: int):
+        """Добавляет файл в дерево по его относительному пути."""
+        try:
+            rel = fp.relative_to(self.root)
+        except ValueError:
+            return
+        # Рекурсивно спускаемся по родительским каталогам и на каждом
+        # узле увеличиваем счётчики (кумулятивно).
+        parts = rel.parts
+        node = self.tree
+        node.add_file(size_bytes)
+        for part in parts[:-1]:  # последний компонент — имя файла
+            node = node.get_or_create(part)
+            node.add_file(size_bytes)
+
+    # -------- печать --------
+
+    def print_tree(self, out=sys.stdout, max_depth: int = 3,
+                   min_bytes: int = 1024):
+        if self.tree.files == 0:
+            return
+
+        total_bytes = self.tree.bytes or 1
+
+        # Считаем максимальную ширину колонки имён (с префиксом дерева).
+        rows: list[tuple[int, str, _DirNode, bool]] = []
+        self._collect_rows(self.tree, 0, max_depth, min_bytes, rows)
+
+        name_col = 1  # минимум — длина "."
+        for level, level_prefix, node, _collapsed in rows:
+            w = len(level_prefix) + len(node.name)
+            if w > name_col:
+                name_col = w
+
+        line_w = name_col + 2 + 7 + 2 + 12 + 2 + 6
+        sep = "=" * line_w
+
+        out.write("\n")
+        out.write(sep + "\n")
+        out.write("СТАТИСТИКА ПО ПОДПАПКАМ\n")
+        out.write(sep + "\n")
+        out.write(
+            f"{'.'.ljust(name_col)}  {'Файлов':>7}  {'Размер':>12}  {'Доля':>6}\n"
+        )
+        out.write("-" * line_w + "\n")
+
+        for level, level_prefix, node, _collapsed in rows:
+            name = level_prefix + node.name
+            size_str = _human_size(node.bytes)
+            share = node.bytes / total_bytes * 100.0
+            out.write(
+                f"{name.ljust(name_col)}  {node.files:>7}  "
+                f"{size_str:>12}  {share:>5.1f}%\n"
+            )
+
+        out.write("-" * line_w + "\n")
+        out.write(
+            f"{'ИТОГО'.ljust(name_col)}  {self.tree.files:>7}  "
+            f"{_human_size(self.tree.bytes):>12}  {100.0:>5.1f}%\n"
+        )
+        out.write(sep + "\n")
+
+    def _collect_rows(self, node: _DirNode, level: int, max_depth: int,
+                      min_bytes: int, rows: list):
+        """Рекурсивно обходит узлы, формируя строки для печати."""
+        # Сортируем детей: по убыванию размера, при равенстве — по имени.
+        children = sorted(
+            node.children.values(),
+            key=lambda c: (-c.bytes, c.name),
+        )
+
+        visible: list[_DirNode] = []
+        collapsed: list[_DirNode] = []
+        for c in children:
+            if c.bytes < min_bytes:
+                collapsed.append(c)
+            else:
+                visible.append(c)
+
+        for c in visible:
+            if level == 0:
+                # верхний уровень — префикс "├── "
+                prefix = "├── "
+            else:
+                # вложенные уровни — отступ + ветка
+                prefix = "│   " * level + "├── "
+            # Последнюю ветку помечаем как "└── " — делаем пост-обработку:
+            rows.append((level + 1, prefix, c, False))
+
+            if max_depth == 0 or level + 1 < max_depth:
+                self._collect_rows(c, level + 1, max_depth, min_bytes, rows)
+            else:
+                # достигли max_depth — если у узла есть дети, помечаем
+                # многоточием
+                if c.children:
+                    self._append_collapsed_row(
+                        rows, level + 1, c, min_bytes,
+                    )
+
+        if collapsed:
+            total_files = sum(c.files for c in collapsed)
+            total_bytes_c = sum(c.bytes for c in collapsed)
+            # Строка "... (ещё N ветвей, X)"
+            label = f"... (ещё {len(collapsed)} ветв., {_human_size(total_bytes_c)})"
+            # Показываем как обычную строку с префиксом
+            if level == 0:
+                prefix = "└── "
+            else:
+                prefix = "│   " * level + "└── "
+            fake = _DirNode(label)
+            fake.files = total_files
+            fake.bytes = total_bytes_c
+            rows.append((level + 1, prefix, fake, True))
+
+    def _append_collapsed_row(self, rows: list, level: int, node: _DirNode,
+                              min_bytes: int):
+        """Добавляет строку-заглушку для узлов на границе max_depth."""
+        # Строка вида "│   ... (вложенные ветви)"
+        prefix = "│   " * level + "└── "
+        label = "... (вложенные ветви)"
+        fake = _DirNode(label)
+        fake.files = node.files
+        fake.bytes = node.bytes
+        rows.append((level + 1, prefix, fake, True))
+
+
+# ---------------------------------------------------------------------------
+# BundleWriter
+# ---------------------------------------------------------------------------
+
 class BundleWriter:
     """Пишет набор файлов в один или несколько выходных бандлов."""
 
-    def __init__(self, output_path: Path, max_size_bytes: int):
+    def __init__(self, output_path: Path, max_size_bytes: int,
+                 stats: "StatsTree | None" = None):
         self.output_path = output_path
         self.max_size_bytes = max_size_bytes
+        self.stats = stats
         self.part_idx = 1
         self.current_size = 0
         self.out = None
@@ -377,6 +562,10 @@ class BundleWriter:
             self.current_size += written
             self.total_written += written
             self.written_files += 1
+            if self.stats is not None:
+                # В статистику идёт «чистый» размер исходного файла,
+                # а не с обёрткой из маркеров.
+                self.stats.add(fp, fsize)
 
     def close(self):
         if self.out is not None:
@@ -413,6 +602,16 @@ def main():
     parser.add_argument("--split-by-dir", action="store_true",
                         help="Каждая папка верхнего уровня получает свой бандл; "
                              "в корневой bundle попадают только файлы, лежащие прямо в корне")
+    parser.add_argument("--stats-depth", type=int, default=3,
+                        help="Максимальная глубина дерева статистики "
+                             "(0 = без ограничения, по умолчанию 3)")
+    parser.add_argument("--stats-min-bytes", type=int, default=1024,
+                        help="Не показывать в дереве ветки меньше N байт "
+                             "(по умолчанию 1024, т.е. 1 КБ)")
+    parser.add_argument("--stats-all", action="store_true",
+                        help="Показывать все ветки (эквивалент --stats-min-bytes 0)")
+    parser.add_argument("--no-stats", action="store_true",
+                        help="Не выводить статистику в конце")
     args = parser.parse_args()
 
     source = Path(args.source).resolve()
@@ -446,6 +645,9 @@ def main():
     max_size_bytes = int(args.max_size * 1024 * 1024) if args.max_size > 0 else 0
     output_path = Path(args.output)
 
+    stats = None if args.no_stats else StatsTree(source)
+    min_bytes = 0 if args.stats_all else args.stats_min_bytes
+
     grand_total_bytes = 0
     grand_total_files = 0
 
@@ -471,7 +673,7 @@ def main():
                 label = key
 
             print(f"\n[{label}] файлов: {len(group_files)}")
-            writer = BundleWriter(target, max_size_bytes)
+            writer = BundleWriter(target, max_size_bytes, stats=stats)
             writer.add_files(group_files, source)
             writer.close()
             grand_total_bytes += writer.total_written
@@ -480,12 +682,16 @@ def main():
         print(f"\nГотово. Всего записано файлов: {grand_total_files}, "
               f"общий объём: {grand_total_bytes / (1024 * 1024):.2f} МБ")
     else:
-        writer = BundleWriter(output_path, max_size_bytes)
+        writer = BundleWriter(output_path, max_size_bytes, stats=stats)
         writer.add_files(files, source)
         writer.close()
 
         print(f"Готово. Записано файлов: {writer.written_files}, "
               f"общий объём: {writer.total_written / (1024 * 1024):.2f} МБ")
+
+    if stats is not None:
+        stats.print_tree(out=sys.stdout, max_depth=args.stats_depth,
+                         min_bytes=min_bytes)
 
 
 if __name__ == "__main__":
