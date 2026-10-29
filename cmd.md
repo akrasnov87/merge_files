@@ -7,3 +7,7 @@ python3 merge_files.py /home/a-krasnov/data/code/projects/skrmo-rushydro/skr-doc
 ### android
 
 python3 merge_files.py /home/a-krasnov/data/code/projects/skrmo-rushydro/skr-android data/skr-android-bundle.txt
+
+### screen-recorder-app
+
+python3 merge_files.py /home/a-krasnov/data/code/utils/screen-recorder-app data/screen-recorder-app.txt
